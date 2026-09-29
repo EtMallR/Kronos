@@ -21,51 +21,39 @@ Example:
     python3 prediction_cn_markets_day.py --symbol 002594
 """
 
-import os
 import argparse
-import time
+from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
 import pandas as pd
-import akshare as ak
 import matplotlib.pyplot as plt
 import sys
-sys.path.append("../")
+
+REPO_DIR = Path(__file__).resolve().parents[1]
+EXAMPLES_DIR = Path(__file__).resolve().parent
+DATA_DIR = EXAMPLES_DIR / "data" / "CN"
+SAVE_DIR = EXAMPLES_DIR / "outputs"
+sys.path.insert(0, str(REPO_DIR))
 from model import Kronos, KronosTokenizer, KronosPredictor
 
-save_dir = "./outputs"
-os.makedirs(save_dir, exist_ok=True)
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Setting
 TOKENIZER_PRETRAINED = "NeoQuasar/Kronos-Tokenizer-base"
 MODEL_PRETRAINED = "NeoQuasar/Kronos-base"
-DEVICE = "cpu"  # "cuda:0"
+DEVICE = "cuda:0"  # "cuda:0"
 MAX_CONTEXT = 512
 LOOKBACK = 400
-PRED_LEN = 120
+PRED_LEN = 1
 T = 1.0
 TOP_P = 0.9
 SAMPLE_COUNT = 1
 
-def load_data(symbol: str) -> pd.DataFrame:
-    print(f"📥 Fetching {symbol} daily data from akshare ...")
+def load_data(data_file) -> pd.DataFrame:
+    data_file = Path(data_file)
+    if not data_file.is_file():
+        raise FileNotFoundError(f"Local history file not found: {data_file}")
 
-    max_retries = 3
-    df = None
-
-    # Retry mechanism
-    for attempt in range(1, max_retries + 1):
-        try:
-            df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="")
-            if df is not None and not df.empty:
-                break
-        except Exception as e:
-            print(f"⚠️ Attempt {attempt}/{max_retries} failed: {e}")
-        time.sleep(1.5)
-
-    # If still empty after retries
-    if df is None or df.empty:
-        print(f"❌ Failed to fetch data for {symbol} after {max_retries} attempts. Exiting.")
-        sys.exit(1)
-    
+    df = pd.read_csv(data_file)
     df.rename(columns={
         "日期": "date",
         "开盘": "open",
@@ -73,8 +61,13 @@ def load_data(symbol: str) -> pd.DataFrame:
         "最高": "high",
         "最低": "low",
         "成交量": "volume",
-        "成交额": "amount"
+        "成交额": "amount",
     }, inplace=True)
+
+    required_cols = ["date", "open", "high", "low", "close", "volume"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"History file is missing columns: {missing_cols}")
 
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
@@ -90,6 +83,12 @@ def load_data(symbol: str) -> pd.DataFrame:
         )
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    if "amount" not in df.columns:
+        df["amount"] = df["close"] * df["volume"]
+    numeric_cols = ["open", "high", "low", "close", "volume", "amount"]
+    if df[numeric_cols].isna().any().any():
+        raise ValueError(f"History file contains missing or invalid values: {data_file}")
+
     # Fix invalid open values
     open_bad = (df["open"] == 0) | (df["open"].isna())
     if open_bad.any():
@@ -101,19 +100,26 @@ def load_data(symbol: str) -> pd.DataFrame:
     if df["amount"].isna().all() or (df["amount"] == 0).all():
         df["amount"] = df["close"] * df["volume"]
 
-    print(f"✅ Data loaded: {len(df)} rows, range: {df['date'].min()} ~ {df['date'].max()}")
-
-    print("Data Head:")
-    print(df.head())
+    print(f"✅ Local history loaded: {len(df)} rows, range: {df['date'].min()} ~ {df['date'].max()}")
 
     return df
 
 
-def prepare_inputs(df):
+def prepare_inputs(df, y_timestamp=None):
+    if len(df) < LOOKBACK:
+        raise ValueError(f"Need at least {LOOKBACK} historical rows, got {len(df)}")
+
     x_df = df.iloc[-LOOKBACK:][["open","high","low","close","volume","amount"]]
     x_timestamp = df.iloc[-LOOKBACK:]["date"]
-    y_timestamp = pd.bdate_range(start=df["date"].iloc[-1] + pd.Timedelta(days=1), periods=PRED_LEN)
-    return x_df, pd.Series(x_timestamp), pd.Series(y_timestamp)
+    if y_timestamp is None:
+        y_timestamp = pd.bdate_range(
+            start=df["date"].iloc[-1] + pd.Timedelta(days=1),
+            periods=PRED_LEN,
+        )
+    y_timestamp = pd.Series(pd.to_datetime(y_timestamp)).reset_index(drop=True)
+    if y_timestamp.empty:
+        raise ValueError("At least one future trading date is required")
+    return x_df, pd.Series(x_timestamp).reset_index(drop=True), y_timestamp
 
 def apply_price_limits(pred_df, last_close, limit_rate=0.1):
     print(f"🔒 Applying ±{limit_rate*100:.0f}% price limit ...")
@@ -140,6 +146,10 @@ def apply_price_limits(pred_df, last_close, limit_rate=0.1):
     return pred_df
 
 
+def truncate_to_2_decimals(value):
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+
 def plot_result(df_hist, df_pred, symbol):
     plt.figure(figsize=(12, 6))
     plt.plot(df_hist["date"], df_hist["close"], label="Historical", color="blue")
@@ -150,20 +160,32 @@ def plot_result(df_hist, df_pred, symbol):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plot_path = os.path.join(save_dir, f"pred_{symbol.replace('.', '_')}_chart.png")
+    plot_path = SAVE_DIR / f"pred_{symbol.replace('.', '_')}_chart.png"
     plt.savefig(plot_path)
     plt.close()
     print(f"📊 Chart saved: {plot_path}")
 
 
-def predict_future(symbol):
+def create_predictor():
     print(f"🚀 Loading Kronos tokenizer:{TOKENIZER_PRETRAINED} model:{MODEL_PRETRAINED} ...")
     tokenizer = KronosTokenizer.from_pretrained(TOKENIZER_PRETRAINED)
     model = Kronos.from_pretrained(MODEL_PRETRAINED)
-    predictor = KronosPredictor(model, tokenizer, device=DEVICE, max_context=MAX_CONTEXT)
+    return KronosPredictor(model, tokenizer, device=DEVICE, max_context=MAX_CONTEXT)
 
-    df = load_data(symbol)
-    x_df, x_timestamp, y_timestamp = prepare_inputs(df)
+
+def predict_future(symbol, data_file=None, as_of_date=None, y_timestamp=None, predictor=None):
+    if data_file is None:
+        data_file = DATA_DIR / f"{symbol}_daily.csv"
+    df = load_data(data_file)
+    if as_of_date is not None:
+        df = df[df["date"] <= pd.Timestamp(as_of_date)].reset_index(drop=True)
+    if df.empty:
+        raise ValueError(f"No history is available on or before {as_of_date}")
+
+    x_df, x_timestamp, y_timestamp = prepare_inputs(df, y_timestamp)
+    pred_len = len(y_timestamp)
+    if predictor is None:
+        predictor = create_predictor()
 
     print("🔮 Generating predictions ...")
 
@@ -171,7 +193,7 @@ def predict_future(symbol):
         df=x_df,
         x_timestamp=x_timestamp,
         y_timestamp=y_timestamp,
-        pred_len=PRED_LEN,
+        pred_len=pred_len,
         T=T,
         top_p=TOP_P,
         sample_count=SAMPLE_COUNT,
@@ -182,6 +204,10 @@ def predict_future(symbol):
     # Apply ±10% price limit
     last_close = df["close"].iloc[-1]
     pred_df = apply_price_limits(pred_df, last_close, limit_rate=0.1)
+    prediction_value_cols = ["open", "high", "low", "close", "volume", "amount"]
+    pred_df[prediction_value_cols] = pred_df[prediction_value_cols].apply(
+        lambda column: column.map(truncate_to_2_decimals)
+    )
 
     # Merge historical and predicted data
     df_out = pd.concat([
@@ -190,19 +216,24 @@ def predict_future(symbol):
     ]).reset_index(drop=True)
 
     # Save CSV
-    out_file = os.path.join(save_dir, f"pred_{symbol.replace('.', '_')}_data.csv")
-    df_out.to_csv(out_file, index=False)
+    out_file = SAVE_DIR / f"pred_{symbol.replace('.', '_')}_data.csv"
+    df_to_save = df_out.copy()
+    prediction_start = len(df)
+    for col in prediction_value_cols:
+        df_to_save[col] = df_to_save[col].astype(object)
+        df_to_save.loc[prediction_start:, col] = pred_df[col].map(lambda value: f"{value:.2f}").to_numpy()
+    df_to_save.to_csv(out_file, index=False)
     print(f"✅ Prediction completed and saved: {out_file}")
 
     # Plot
     plot_result(df, pred_df, symbol)
+    return df_out
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kronos stock prediction script")
     parser.add_argument("--symbol", type=str, default="000001", help="Stock code")
+    parser.add_argument("--data-file", type=Path, help="Local historical CSV path")
     args = parser.parse_args()
 
-    predict_future(
-        symbol=args.symbol,
-    )
+    predict_future(symbol=args.symbol, data_file=args.data_file)
